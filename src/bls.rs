@@ -22,9 +22,13 @@ pub enum Error {
     MessageTooLong { expected: usize, actual: usize },
 }
 
+#[derive(Clone)]
 pub struct SecretKey(min_pk::SecretKey);
 
+#[derive(Clone, Copy)]
 pub struct PublicKey(min_pk::PublicKey);
+
+#[derive(Clone, Copy)]
 pub struct PublicKeyHash(Output<Sha256>);
 
 impl SecretKey {
@@ -37,12 +41,23 @@ impl SecretKey {
         let sk = min_pk::SecretKey::key_gen(ikm, &[]).map_err(Error::InvalidSecretKey)?;
         Ok(SecretKey(sk))
     }
+
+    pub fn to_public_key(&self) -> PublicKey {
+        PublicKey(self.0.sk_to_pk())
+    }
 }
 
 impl PublicKey {
     pub fn from_bytes(bytes: &[u8; 48]) -> Result<Self, Error> {
         let pk = min_pk::PublicKey::key_validate(bytes).map_err(Error::InvalidSecretKey)?;
         Ok(PublicKey(pk))
+    }
+
+    fn address(&self) -> PublicKeyHash {
+        let mut hasher = Sha256::new();
+        hasher.update(self.0.to_bytes());
+        let hash = hasher.finalize();
+        PublicKeyHash(hash)
     }
 }
 
@@ -55,6 +70,43 @@ impl fmt::Display for PublicKey {
 impl fmt::Display for PublicKeyHash {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "0x{}", hex::encode(self.0))
+    }
+}
+
+#[derive(Clone)]
+
+pub struct SecretWallet {
+    secret_key: SecretKey,
+    public_key: PublicKey,
+    public_key_hash: PublicKeyHash,
+}
+
+impl From<SecretKey> for SecretWallet {
+    fn from(secret_key: SecretKey) -> Self {
+        let public_key = secret_key.to_public_key();
+        let public_key_hash = public_key.address();
+
+        SecretWallet {
+            secret_key,
+            public_key,
+            public_key_hash,
+        }
+    }
+}
+
+pub struct PublicWallet {
+    public_key: PublicKey,
+    public_key_hash: PublicKeyHash,
+}
+
+impl From<PublicKey> for PublicWallet {
+    fn from(public_key: PublicKey) -> Self {
+        let public_key_hash = public_key.address();
+
+        PublicWallet {
+            public_key,
+            public_key_hash,
+        }
     }
 }
 
@@ -110,22 +162,22 @@ impl Bls {
 }
 
 impl KeyPair for Bls {
-    type SecretKey = SecretKey;
-    type PublicKey = PublicKey;
+    type SecretKey = SecretWallet;
+    type PublicKey = PublicWallet;
 
-    fn to_public_key(secret_key: &Self::SecretKey) -> Self::PublicKey {
-        PublicKey(secret_key.0.sk_to_pk())
+    fn to_public_key(secret_wallet: &SecretWallet) -> PublicWallet {
+        PublicWallet {
+            public_key: secret_wallet.public_key.clone(),
+            public_key_hash: secret_wallet.public_key_hash.clone(),
+        }
     }
 }
 
 impl Address for Bls {
     type PublicKeyHash = PublicKeyHash;
 
-    fn address(public_key: &Self::PublicKey) -> Self::PublicKeyHash {
-        let mut hasher = Sha256::new();
-        hasher.update(public_key.0.to_bytes());
-        let hash = hasher.finalize();
-        PublicKeyHash(hash)
+    fn address(public_wallet: &PublicWallet) -> PublicKeyHash {
+        public_wallet.public_key_hash
     }
 }
 
@@ -143,50 +195,50 @@ impl Signer for Bls {
     type Signature = Signature;
     type Error = Error;
 
-    fn sign(secret_key: &Self::SecretKey, message: &[u8]) -> Result<Self::Signature, Error> {
-        let pk_hash = Bls::to_public_key_hash(secret_key);
+    fn sign(wallet: &Self::SecretKey, message: &[u8]) -> Result<Self::Signature, Error> {
+        let pk_hash = wallet.public_key_hash;
         let message = Bls::prepend_pkh_owned(message, &pk_hash);
-        Ok(Signature(secret_key.0.sign(&message, DST, &[])))
+        Ok(Signature(wallet.secret_key.0.sign(&message, DST, &[])))
     }
 
     fn verify(
-        public_key: &Self::PublicKey,
+        wallet: &PublicWallet,
         message: &[u8],
         signature: &Self::Signature,
     ) -> Result<bool, Error> {
-        let pk_hash = Bls::address(public_key);
+        let pk_hash = wallet.public_key_hash;
         let message = Bls::prepend_pkh_owned(message, &pk_hash);
 
         Ok(signature
             .0
-            .verify(false, &message, DST, &[], &public_key.0, false)
+            .verify(false, &message, DST, &[], &wallet.public_key.0, false)
             == BLST_ERROR::BLST_SUCCESS)
     }
 }
 
 impl SignerBuf for Bls {
     fn sign_no_alloc(
-        secret_key: &Self::SecretKey,
+        wallet: &SecretWallet,
         message: &[u8],
         buf: &mut [u8],
     ) -> Result<Self::Signature, Error> {
-        let pk_hash = Bls::to_public_key_hash(secret_key);
+        let pk_hash = wallet.public_key_hash;
         let message = Bls::prepend_pkh(message, &pk_hash, Some(buf))?;
-        Ok(Signature(secret_key.0.sign(&message, DST, &[])))
+        Ok(Signature(wallet.secret_key.0.sign(&message, DST, &[])))
     }
 
     fn verify_no_alloc(
-        public_key: &Self::PublicKey,
+        wallet: &PublicWallet,
         message: &[u8],
         signature: &Self::Signature,
         buf: &mut [u8],
     ) -> Result<bool, Error> {
-        let pk_hash = Bls::address(public_key);
+        let pk_hash = wallet.public_key_hash;
         let message = Bls::prepend_pkh(message, &pk_hash, Some(buf))?;
 
         Ok(signature
             .0
-            .verify(false, &message, DST, &[], &public_key.0, false)
+            .verify(false, &message, DST, &[], &wallet.public_key.0, false)
             == BLST_ERROR::BLST_SUCCESS)
     }
 }
@@ -223,10 +275,10 @@ impl AggregateSigner for Bls {
         let (messages, public_keys): (Vec<_>, Vec<&min_pk::PublicKey>) = messages_with_pks
             .iter()
             .map(|(m, pk)| {
-                let pk_hash = Bls::address(pk);
+                let pk_hash = pk.public_key_hash;
                 let message = Bls::prepend_pkh(m.as_ref(), &pk_hash, None)
                     .expect("prepend_pkh cannot fail when called with buf = None");
-                (message, &pk.0)
+                (message, &pk.public_key.0)
             })
             .unzip();
 
@@ -259,7 +311,7 @@ mod tests {
         // 45 bytes are enough for the public key hash and the message
         let mut buf = [0u8; 45];
         let ikm = [1u8; 32];
-        let secret_key = SecretKey::key_gen(&ikm).unwrap();
+        let secret_key = SecretKey::key_gen(&ikm).unwrap().into();
         let public_key = Bls::to_public_key(&secret_key);
         let message = b"Hello, world!";
 
@@ -272,7 +324,7 @@ mod tests {
         let mut buf = [0u8; 47];
 
         let ikm = [1u8; 32];
-        let secret_key = SecretKey::key_gen(&ikm).unwrap();
+        let secret_key = SecretKey::key_gen(&ikm).unwrap().into();
         let public_key = Bls::to_public_key(&secret_key);
         let message = b"Hello, world!";
         let wrong_message = b"Goodbye, world!";
@@ -284,9 +336,9 @@ mod tests {
     fn test_sign_verify_wrong_signature_fails() {
         let mut buf = [0u8; 45];
         let ikm = [1u8; 32];
-        let secret_key = SecretKey::key_gen(&ikm).unwrap();
+        let secret_key = SecretKey::key_gen(&ikm).unwrap().into();
         let public_key = Bls::to_public_key(&secret_key);
-        let wrong_secret_key = SecretKey::key_gen(&[2u8; 32]).unwrap();
+        let wrong_secret_key = SecretKey::key_gen(&[2u8; 32]).unwrap().into();
 
         let message = b"Hello, world!";
         let wrong_signature = Bls::sign_no_alloc(&wrong_secret_key, message, &mut buf).unwrap();
@@ -298,8 +350,8 @@ mod tests {
         let mut buf = [0u8; 45];
         let ikm1 = [1u8; 32];
         let ikm2 = [2u8; 32];
-        let secret_key1 = SecretKey::key_gen(&ikm1).unwrap();
-        let secret_key2 = SecretKey::key_gen(&ikm2).unwrap();
+        let secret_key1 = SecretKey::key_gen(&ikm1).unwrap().into();
+        let secret_key2 = SecretKey::key_gen(&ikm2).unwrap().into();
         let public_key1 = Bls::to_public_key(&secret_key1);
         let public_key2 = Bls::to_public_key(&secret_key2);
         let message = b"Hello, world!";
@@ -318,8 +370,8 @@ mod tests {
         let mut buf = [0u8; 47];
         let ikm1 = [1u8; 32];
         let ikm2 = [2u8; 32];
-        let secret_key1 = SecretKey::key_gen(&ikm1).unwrap();
-        let secret_key2 = SecretKey::key_gen(&ikm2).unwrap();
+        let secret_key1 = SecretKey::key_gen(&ikm1).unwrap().into();
+        let secret_key2 = SecretKey::key_gen(&ikm2).unwrap().into();
         let public_key1 = Bls::to_public_key(&secret_key1);
         let public_key2 = Bls::to_public_key(&secret_key2);
         let message1 = b"Hello, world!";
@@ -357,7 +409,7 @@ mod tests {
     #[test]
     fn verify_signable() {
         let ikm = [1u8; 32];
-        let secret_key = SecretKey::key_gen(&ikm).unwrap();
+        let secret_key = SecretKey::key_gen(&ikm).unwrap().into();
         let public_key = Bls::to_public_key(&secret_key);
         let message = b"Hello, world!";
         let signable = TestSignable::from(message.as_slice());
