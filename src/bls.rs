@@ -1,9 +1,12 @@
-use std::fmt::{self, Formatter};
+use std::{
+    borrow::Cow,
+    fmt::{self, Formatter},
+};
 
 use blst::{BLST_ERROR, min_pk};
 use sha2::{Digest, Sha256, digest::Output};
 
-use crate::crypto::{Address, AggregateSigner, KeyPair, Signer};
+use crate::crypto::{Address, AggregateSigner, KeyPair, Signer, SignerBuf};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -15,9 +18,12 @@ pub enum Error {
     SignatureAggregationFailed(BLST_ERROR),
     #[error("Invalid signature: {0:?}")]
     InvalidSignature(BLST_ERROR),
+    #[error("Message does not fit in buffer: expected {expected}, actual {actual}")]
+    MessageTooLong { expected: usize, actual: usize },
 }
 
 pub struct SecretKey(min_pk::SecretKey);
+
 pub struct PublicKey(min_pk::PublicKey);
 pub struct PublicKeyHash(Output<Sha256>);
 
@@ -60,11 +66,46 @@ pub const DST: &[u8] = &[
 pub struct Bls;
 
 impl Bls {
-    fn prepend_pkh(message: &[u8], pkh: &PublicKeyHash) -> Vec<u8> {
-        let mut message_with_pkh = Vec::with_capacity(message.len() + pkh.0.len());
-        message_with_pkh.extend_from_slice(message);
-        message_with_pkh.extend_from_slice(&pkh.0);
-        message_with_pkh
+    fn prepend_pkh_borrowed(
+        message: &[u8],
+        pkh: &PublicKeyHash,
+        buf: &mut [u8],
+    ) -> Result<usize, Error> {
+        let pkh_len = pkh.0.len();
+        let message_len = message.len();
+        if buf.len() < pkh_len + message_len {
+            return Err(Error::MessageTooLong {
+                expected: pkh_len + message_len,
+                actual: buf.len(),
+            });
+        }
+        buf[0..pkh_len].copy_from_slice(&pkh.0);
+        buf[pkh_len..pkh_len + message_len].copy_from_slice(message);
+        Ok(pkh_len + message_len)
+    }
+
+    fn prepend_pkh_owned(message: &[u8], pkh: &PublicKeyHash) -> Vec<u8> {
+        let mut buf = vec![0u8; pkh.0.len() + message.len()];
+        buf[0..pkh.0.len()].copy_from_slice(&pkh.0);
+        buf[pkh.0.len()..].copy_from_slice(message);
+        buf
+    }
+
+    fn prepend_pkh<'a>(
+        message: &[u8],
+        pkh: &PublicKeyHash,
+        buf: Option<&'a mut [u8]>,
+    ) -> Result<Cow<'a, [u8]>, Error> {
+        match buf {
+            Some(buf) => {
+                let bytes_written = Self::prepend_pkh_borrowed(message, pkh, buf)?;
+                Ok(Cow::Borrowed(&buf[0..bytes_written]))
+            }
+            None => {
+                let vec = Self::prepend_pkh_owned(message, pkh);
+                Ok(Cow::Owned(vec))
+            }
+        }
     }
 }
 
@@ -100,22 +141,53 @@ impl Signature {
 
 impl Signer for Bls {
     type Signature = Signature;
+    type Error = Error;
 
-    fn sign(secret_key: &Self::SecretKey, message: &[u8]) -> Self::Signature {
+    fn sign(secret_key: &Self::SecretKey, message: &[u8]) -> Result<Self::Signature, Error> {
         let pk_hash = Bls::to_public_key_hash(secret_key);
-        let message = Bls::prepend_pkh(message, &pk_hash);
-
-        Signature(secret_key.0.sign(&message, DST, &[]))
+        let message = Bls::prepend_pkh_owned(message, &pk_hash);
+        Ok(Signature(secret_key.0.sign(&message, DST, &[])))
     }
 
-    fn verify(public_key: &Self::PublicKey, message: &[u8], signature: &Self::Signature) -> bool {
+    fn verify(
+        public_key: &Self::PublicKey,
+        message: &[u8],
+        signature: &Self::Signature,
+    ) -> Result<bool, Error> {
         let pk_hash = Bls::address(public_key);
-        let message = Bls::prepend_pkh(message, &pk_hash);
+        let message = Bls::prepend_pkh_owned(message, &pk_hash);
 
-        signature
+        Ok(signature
             .0
-            .verify(false, &message, DST, &[], &public_key.0, true)
-            == BLST_ERROR::BLST_SUCCESS
+            .verify(false, &message, DST, &[], &public_key.0, false)
+            == BLST_ERROR::BLST_SUCCESS)
+    }
+}
+
+impl SignerBuf for Bls {
+    fn sign_no_alloc(
+        secret_key: &Self::SecretKey,
+        message: &[u8],
+        buf: &mut [u8],
+    ) -> Result<Self::Signature, Error> {
+        let pk_hash = Bls::to_public_key_hash(secret_key);
+        let message = Bls::prepend_pkh(message, &pk_hash, Some(buf))?;
+        Ok(Signature(secret_key.0.sign(&message, DST, &[])))
+    }
+
+    fn verify_no_alloc(
+        public_key: &Self::PublicKey,
+        message: &[u8],
+        signature: &Self::Signature,
+        buf: &mut [u8],
+    ) -> Result<bool, Error> {
+        let pk_hash = Bls::address(public_key);
+        let message = Bls::prepend_pkh(message, &pk_hash, Some(buf))?;
+
+        Ok(signature
+            .0
+            .verify(false, &message, DST, &[], &public_key.0, false)
+            == BLST_ERROR::BLST_SUCCESS)
     }
 }
 
@@ -132,7 +204,6 @@ impl AggregateSignature {
 
 impl AggregateSigner for Bls {
     type AggregateSignature = AggregateSignature;
-    type Error = Error;
 
     fn aggregate_signatures(
         signatures: &[Self::Signature],
@@ -147,16 +218,21 @@ impl AggregateSigner for Bls {
         messages_with_pks: &[(impl AsRef<[u8]>, &Self::PublicKey)],
         aggregate_signature: &Self::AggregateSignature,
     ) -> bool {
+        //TODO: Optimize this
+
         let (messages, public_keys): (Vec<_>, Vec<&min_pk::PublicKey>) = messages_with_pks
             .iter()
             .map(|(m, pk)| {
                 let pk_hash = Bls::address(pk);
-                let message = Bls::prepend_pkh(m.as_ref(), &pk_hash);
+                let message = Bls::prepend_pkh(m.as_ref(), &pk_hash, None)
+                    .expect("prepend_pkh cannot fail when called with buf = None");
                 (message, &pk.0)
             })
             .unzip();
 
-        let messages = messages.iter().map(|m| m.as_slice()).collect::<Vec<_>>();
+        // We need to allocate a new vector to hold the references, as this is required by the signature of
+        // `blst::aggregate_verify`.
+        let messages = messages.iter().map(|m| m.as_ref()).collect::<Vec<_>>();
 
         aggregate_signature.0.to_signature().aggregate_verify(
             true,
@@ -174,45 +250,52 @@ mod tests {
 
     use super::*;
     use crate::{
-        crypto::{Signable, SignableExt, Signer},
+        crypto::{Signable, SignableExt},
         encode::Ssz,
     };
 
     #[test]
     fn test_sign_verify() {
+        // 45 bytes are enough for the public key hash and the message
+        let mut buf = [0u8; 45];
         let ikm = [1u8; 32];
         let secret_key = SecretKey::key_gen(&ikm).unwrap();
         let public_key = Bls::to_public_key(&secret_key);
         let message = b"Hello, world!";
-        let signature = Bls::sign(&secret_key, message);
-        assert!(Bls::verify(&public_key, message, &signature));
+
+        let signature = Bls::sign_no_alloc(&secret_key, message, &mut buf).unwrap();
+        assert!(Bls::verify_no_alloc(&public_key, message, &signature, &mut buf).unwrap());
     }
 
     #[test]
     fn test_sign_verify_wrong_message_fails() {
+        let mut buf = [0u8; 47];
+
         let ikm = [1u8; 32];
         let secret_key = SecretKey::key_gen(&ikm).unwrap();
         let public_key = Bls::to_public_key(&secret_key);
         let message = b"Hello, world!";
         let wrong_message = b"Goodbye, world!";
-        let signature = Bls::sign(&secret_key, wrong_message);
-        assert!(!Bls::verify(&public_key, message, &signature));
+        let signature = Bls::sign_no_alloc(&secret_key, wrong_message, &mut buf).unwrap();
+        assert!(!Bls::verify_no_alloc(&public_key, message, &signature, &mut buf).unwrap());
     }
 
     #[test]
     fn test_sign_verify_wrong_signature_fails() {
+        let mut buf = [0u8; 45];
         let ikm = [1u8; 32];
         let secret_key = SecretKey::key_gen(&ikm).unwrap();
         let public_key = Bls::to_public_key(&secret_key);
         let wrong_secret_key = SecretKey::key_gen(&[2u8; 32]).unwrap();
 
         let message = b"Hello, world!";
-        let wrong_signature = Bls::sign(&wrong_secret_key, message);
-        assert!(!Bls::verify(&public_key, message, &wrong_signature));
+        let wrong_signature = Bls::sign_no_alloc(&wrong_secret_key, message, &mut buf).unwrap();
+        assert!(!Bls::verify_no_alloc(&public_key, message, &wrong_signature, &mut buf).unwrap());
     }
 
     #[test]
     fn test_aggregate_signatures() {
+        let mut buf = [0u8; 45];
         let ikm1 = [1u8; 32];
         let ikm2 = [2u8; 32];
         let secret_key1 = SecretKey::key_gen(&ikm1).unwrap();
@@ -220,8 +303,8 @@ mod tests {
         let public_key1 = Bls::to_public_key(&secret_key1);
         let public_key2 = Bls::to_public_key(&secret_key2);
         let message = b"Hello, world!";
-        let signature1 = Bls::sign(&secret_key1, message);
-        let signature2 = Bls::sign(&secret_key2, message);
+        let signature1 = Bls::sign_no_alloc(&secret_key1, message, &mut buf).unwrap();
+        let signature2 = Bls::sign_no_alloc(&secret_key2, message, &mut buf).unwrap();
 
         let aggregate_signature = Bls::aggregate_signatures(&[signature1, signature2]).unwrap();
         assert!(Bls::verify_aggregate_signature(
@@ -232,6 +315,7 @@ mod tests {
 
     #[test]
     fn test_aggregate_signatures_swap_pks_fails() {
+        let mut buf = [0u8; 47];
         let ikm1 = [1u8; 32];
         let ikm2 = [2u8; 32];
         let secret_key1 = SecretKey::key_gen(&ikm1).unwrap();
@@ -240,8 +324,8 @@ mod tests {
         let public_key2 = Bls::to_public_key(&secret_key2);
         let message1 = b"Hello, world!";
         let message2 = b"Goodbye, world!";
-        let signature1 = Bls::sign(&secret_key1, message1);
-        let signature2 = Bls::sign(&secret_key2, message2);
+        let signature1 = Bls::sign_no_alloc(&secret_key1, message1, &mut buf).unwrap();
+        let signature2 = Bls::sign_no_alloc(&secret_key2, message2, &mut buf).unwrap();
 
         let aggregate_signature = Bls::aggregate_signatures(&[signature1, signature2]).unwrap();
         assert!(!Bls::verify_aggregate_signature(
@@ -277,7 +361,11 @@ mod tests {
         let public_key = Bls::to_public_key(&secret_key);
         let message = b"Hello, world!";
         let signable = TestSignable::from(message.as_slice());
-        let signature = signable.sign::<Bls, Ssz>(&secret_key);
-        assert!(signable.verify::<Bls, Ssz>(&public_key, &signature));
+        let signature = signable.sign::<Bls, Ssz>(&secret_key).unwrap();
+        assert!(
+            signable
+                .verify::<Bls, Ssz>(&public_key, &signature)
+                .unwrap()
+        );
     }
 }

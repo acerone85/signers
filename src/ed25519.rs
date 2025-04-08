@@ -40,12 +40,17 @@ pub struct Signature(ed25519_dalek::Signature);
 
 impl crypto::Signer for Ed25519 {
     type Signature = Signature;
+    type Error = std::convert::Infallible;
 
-    fn sign(secret_key: &Self::SecretKey, message: &[u8]) -> Self::Signature {
-        Signature(secret_key.0.sign(message))
+    fn sign(secret_key: &Self::SecretKey, message: &[u8]) -> Result<Self::Signature, Self::Error> {
+        Ok(Signature(secret_key.0.sign(message)))
     }
 
-    fn verify(public_key: &Self::PublicKey, message: &[u8], signature: &Self::Signature) -> bool {
-        public_key.0.verify(message, &signature.0).is_ok()
+    fn verify(
+        public_key: &Self::PublicKey,
+        message: &[u8],
+        signature: &Self::Signature,
+    ) -> Result<bool, Self::Error> {
+        Ok(public_key.0.verify(message, &signature.0).is_ok())
     }
 }

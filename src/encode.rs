@@ -1,4 +1,4 @@
-pub trait Encoder {}
+pub trait Encoder {}    // Marker trait
 
 pub trait Encodable<E: Encoder> {
     fn encode(&self) -> impl AsRef<[u8]>;
