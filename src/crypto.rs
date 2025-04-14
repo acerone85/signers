@@ -57,52 +57,14 @@ pub trait AggregateSigner: Signer {
     ) -> bool;
 }
 
-pub trait Signable {}
-
-pub trait SignableExt: Signable {
+pub trait Signable {
     fn sign_no_alloc<C: SignerBuf, E: Encoder>(
         &self,
         secret_key: &C::SecretKey,
         buf: &mut [u8],
     ) -> Result<C::Signature, C::Error>
     where
-        Self: Encodable<E>;
-    fn verify_no_alloc<C: SignerBuf, E: Encoder>(
-        &self,
-        messages_with_pks: &C::PublicKey,
-        signature: &C::Signature,
-        buf: &mut [u8],
-    ) -> Result<bool, C::Error>
-    where
-        Self: Encodable<E>;
-
-    fn sign<C: Signer, E: Encoder>(
-        &self,
-        secret_key: &C::SecretKey,
-    ) -> Result<C::Signature, C::Error>
-    where
-        Self: Encodable<E>;
-
-    fn verify<C: Signer, E: Encoder>(
-        &self,
-        public_key: &C::PublicKey,
-        signature: &C::Signature,
-    ) -> Result<bool, C::Error>
-    where
-        Self: Encodable<E>;
-}
-
-impl<P> SignableExt for P
-where
-    P: Signable,
-{
-    fn sign_no_alloc<C: SignerBuf, E: Encoder>(
-        &self,
-        secret_key: &C::SecretKey,
-        buf: &mut [u8],
-    ) -> Result<C::Signature, C::Error>
-    where
-        P: Encodable<E>,
+        Self: Encodable<E>,
     {
         C::sign_no_alloc(secret_key, self.encode().as_ref(), buf)
     }
@@ -114,7 +76,7 @@ where
         buf: &mut [u8],
     ) -> Result<bool, C::Error>
     where
-        P: Encodable<E>,
+        Self: Encodable<E>,
     {
         C::verify_no_alloc(public_key, self.encode().as_ref(), signature, buf)
     }
@@ -124,7 +86,7 @@ where
         secret_key: &C::SecretKey,
     ) -> Result<C::Signature, C::Error>
     where
-        P: Encodable<E>,
+        Self: Encodable<E>,
     {
         C::sign(secret_key, self.encode().as_ref())
     }
@@ -135,7 +97,7 @@ where
         signature: &C::Signature,
     ) -> Result<bool, C::Error>
     where
-        P: Encodable<E>,
+        Self: Encodable<E>,
     {
         C::verify(public_key, self.encode().as_ref(), signature)
     }
